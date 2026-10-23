@@ -321,18 +321,24 @@ def parse_json_text(text):
         raise
 
 
-def ai_chat(messages, deadline, max_tokens=12000):
+def ai_chat(messages, deadline, max_tokens=12000, model=None,
+            reasoning="__default__", json_mode=True):
     if not AI_API_KEY:
         raise RuntimeError("AI_API_KEY missing")
-    body = {"model": AI_MODEL, "messages": messages, "temperature": 0,
-            "response_format": {"type": "json_object"}, "max_tokens": max_tokens}
-    if AI_REASONING:
-        body["reasoning_effort"] = AI_REASONING
+    models = [m.strip() for m in (model or AI_MODEL).split(",") if m.strip()]
+    eff = AI_REASONING if reasoning == "__default__" else reasoning
+    body = {"model": models[0], "messages": messages, "temperature": 0,
+            "max_tokens": max_tokens}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    if eff:
+        body["reasoning_effort"] = eff
     last = None
     for attempt in range(4):
         remaining = deadline - time.time()
         if remaining < 6:
             break
+        body["model"] = models[attempt % len(models)]  # if one model fails, try the next
         try:
             with httpx.Client(timeout=min(remaining, 50)) as client:
                 r = client.post(f"{AI_BASE_URL}/chat/completions",
@@ -343,18 +349,18 @@ def ai_chat(messages, deadline, max_tokens=12000):
                 body.pop("reasoning_effort")
                 continue
             if r.status_code in (429, 500, 502, 503, 504):
-                last = f"HTTP {r.status_code}: {r.text[:200]}"
+                last = f"{body['model']} HTTP {r.status_code}: {r.text[:200]}"
                 AI_ERRORS.append(last)
                 time.sleep(min(2 * (attempt + 1), max(0, remaining - 8)))
                 continue
             if r.status_code >= 400:
-                last = f"HTTP {r.status_code}: {r.text[:300]}"
+                last = f"{body['model']} HTTP {r.status_code}: {r.text[:300]}"
                 AI_ERRORS.append(last)
-                break
+                continue
             text = r.json()["choices"][0]["message"]["content"]
             return parse_json_text(text)
         except Exception as e:
-            last = f"{type(e).__name__}: {str(e)[:200]}"
+            last = f"{body['model']} {type(e).__name__}: {str(e)[:200]}"
             AI_ERRORS.append(last)
     raise RuntimeError(f"AI failed: {last}")
 
@@ -672,12 +678,31 @@ async def debug_log():
 
 
 @app.get("/debug/ai-test")
-def debug_ai_test():
+def debug_ai_test(model: str = "", reasoning: str = "default", json: int = 1):
+    """Quick check that the AI answers. Optional: ?model=NAME&reasoning=off|low|medium|high&json=0"""
     t = time.time()
+    eff = "__default__" if reasoning == "default" else ("" if reasoning == "off" else reasoning)
     try:
         out = ai_chat([{"role": "user", "content": 'Reply with exactly this JSON: {"ok": true}'}],
-                      time.time() + 40, max_tokens=200)
-        return {"ok": True, "seconds": round(time.time() - t, 1), "model": AI_MODEL, "reply": out}
+                      time.time() + 45, max_tokens=300, model=model or None,
+                      reasoning=eff, json_mode=bool(json))
+        return {"ok": True, "seconds": round(time.time() - t, 1), "model": model or AI_MODEL,
+                "reasoning": reasoning, "json": json, "reply": out}
     except Exception as e:
-        return {"ok": False, "seconds": round(time.time() - t, 1), "model": AI_MODEL,
-                "error": str(e)[:400], "recent_errors": list(AI_ERRORS)[-5:]}
+        return {"ok": False, "seconds": round(time.time() - t, 1), "model": model or AI_MODEL,
+                "reasoning": reasoning, "json": json, "error": str(e)[:400],
+                "recent_errors": list(AI_ERRORS)[-5:]}
+
+
+@app.get("/debug/models")
+def debug_models():
+    """Lists the model names this key can use."""
+    try:
+        with httpx.Client(timeout=20) as client:
+            r = client.get(f"{AI_BASE_URL}/models", headers={"Authorization": f"Bearer {AI_API_KEY}"})
+        if r.status_code >= 400:
+            return {"ok": False, "status": r.status_code, "error": r.text[:300]}
+        ids = [m.get("id", "").replace("models/", "") for m in r.json().get("data", [])]
+        return {"ok": True, "models": sorted(i for i in ids if "gemini" in i)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
