@@ -9,7 +9,7 @@ ACTIONS = ["create_draft", "update_internal_record", "send_approved_notice",
            "request_confirmation", "quarantine_item", "no_action"]
 DB_PATH = os.environ.get("DB_PATH", "/tmp/mailroom.db")
 MODELS = [m.strip() for m in os.environ.get("AI_MODEL", "gemini-3.5-flash").split(",")]
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GEMINI_URL = os.environ.get("AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/") + "/chat/completions"
 
 app = FastAPI()
 LOCK = asyncio.Lock()
@@ -187,7 +187,7 @@ async def ask(client, batch):
         try:
             r = await client.post(
                 GEMINI_URL,
-                headers={"Authorization": "Bearer " + os.environ["GEMINI_API_KEY"]},
+                headers={"Authorization": "Bearer " + os.environ["AI_API_KEY"]},
                 json={"model": m, "temperature": 0,
                       "response_format": {"type": "json_object"},
                       "messages": [{"role": "system", "content": SYSTEM},
