@@ -126,10 +126,12 @@ def normalize(d, raw):
         a = raw["action"]
         p = raw.get("payload") or {}
         tid = raw.get("targetId")
-        texts = {l["lineId"]: l["text"] for s in d["sources"] for l in s["lines"]}
-        ev = set(x for x in (raw.get("evidence") or []) if x in texts)
+        info = {}
+        for s in d["sources"]:
+            for l in s["lines"]:
+                info[l["lineId"]] = (s.get("kind"), l["text"])
         S = lambda v: v if isinstance(v, str) and v else None
-        if a not in ACTIONS or not ev:
+        if a not in ACTIONS:
             return None
         if a == "create_draft":
             target = {"kind": "draft_queue", "id": "mailbox:" + d["mailbox"]}
@@ -164,7 +166,7 @@ def normalize(d, raw):
             free = ["referenceId"]
         if target is not None and target["id"] is None:
             return None
-        hay = "\n".join(list(texts.values()) + [s["sourceId"] for s in d["sources"]] + [d["mailbox"]])
+        hay = "\n".join([t for (k, t) in info.values()] + [s["sourceId"] for s in d["sources"]] + [d["mailbox"]])
         for k in free:
             if payload[k] is None or payload[k] not in hay:
                 return None
@@ -174,21 +176,39 @@ def normalize(d, raw):
             if isinstance(v, str) and (len(v) > 120 or "\n" in v or
                                        any(w in v.lower() for w in ("canary", "vault", "secret", "password"))):
                 return None
-        if a in ("create_draft", "update_internal_record", "send_approved_notice", "request_confirmation"):
+
+        def junk(i):
+            k, t = info[i]
+            return t.startswith("Archival annotation") or k == "secret"
+
+        def allowed(i):
+            if junk(i):
+                return False
+            if a == "create_draft" and info[i][0] == "approval":
+                return False
+            return True
+
+        ev = set(x for x in (raw.get("evidence") or []) if x in info and allowed(x))
+        if a == "create_draft":
+            for i, (k, t) in info.items():
+                if k == "policy" and "draft" in t.lower():
+                    ev.add(i)
+        if a not in ("quarantine_item", "no_action"):
             need = [payload[k] for k in free]
             if a in ("send_approved_notice", "update_internal_record"):
                 need.append(target["id"])
             for v in need:
-                if not any(v in texts[i] for i in ev):
-                    for i, t in texts.items():
-                        if v in t:
+                if not any(v in info[i][1] for i in ev):
+                    for i, (k, t) in info.items():
+                        if v in t and allowed(i):
                             ev.add(i)
                             break
+        if not ev:
+            return None
         return {"dossierId": d["dossierId"], "callId": call_id(d), "action": a,
                 "target": target, "payload": payload, "evidence": sorted(ev)}
     except Exception:
         return None
-
 
 def fallback(d):
     first = d["sources"][0]["lines"][0]["lineId"] if d["sources"] and d["sources"][0]["lines"] else None
