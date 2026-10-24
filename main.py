@@ -127,9 +127,6 @@ def trusted(prov):
     return isinstance(prov, str) and (prov.startswith("signed") or prov.startswith("authenticated"))
 
 
-CASELOG = {}
-
-
 def normalize(d, raw):
     try:
         a = raw["action"]
@@ -219,41 +216,27 @@ def normalize(d, raw):
             return True
 
         ev = set(x for x in (raw.get("evidence") or []) if x in info and allowed(x))
-        if a in ("create_draft", "send_approved_notice"):
+        if a == "create_draft":
             for i, (k, t) in info.items():
-                if t.startswith("Mailroom rule") and allowed(i):
+                if k == "policy" and "draft" in t.lower():
                     ev.add(i)
-        if a == "quarantine_item":
-            for s in d["sources"]:
-                if s["sourceId"] == payload["artifactId"]:
-                    for l in s["lines"]:
-                        if allowed(l["lineId"]):
-                            ev.add(l["lineId"])
-        else:
+        if a not in ("quarantine_item", "no_action"):
             need = [payload[k] for k in free]
             if a in ("send_approved_notice", "update_internal_record"):
                 need.append(target["id"])
             for v in need:
-                if isinstance(v, str) and len(v) >= 4:
+                if not any(v in info[i][1] for i in ev):
                     for i, (k, t) in info.items():
-                        if v in t and allowed(i) and k != "history":
+                        if v in t and allowed(i):
                             ev.add(i)
+                            break
         if not ev:
             return None
-        n = CASELOG.get(a, 0)
-        if n < 2:
-            CASELOG[a] = n + 1
-            show = {i: t[:120] for i, (k, t) in info.items()
-                    if k not in ("history", "secret") and not t.startswith("Archival annotation")}
-            print("CASE", json.dumps({"action": a, "target": target, "payload": payload,
-                                      "evidence": sorted(ev),
-                                      "sources": [[s["sourceId"], s.get("kind"), s.get("provenance")]
-                                                  for s in d["sources"]],
-                                      "lines": show}, ensure_ascii=False), flush=True)
         return {"dossierId": d["dossierId"], "callId": call_id(d), "action": a,
                 "target": target, "payload": payload, "evidence": sorted(ev)}
     except Exception:
         return None
+
 
 def fallback(d):
     first = d["sources"][0]["lines"][0]["lineId"] if d["sources"] and d["sources"][0]["lines"] else None
@@ -443,7 +426,7 @@ async def commit(b):
     ev = c.execute("SELECT digest, verifier, response FROM evals WHERE eval_id=?",
                    (b["evaluationId"],)).fetchone()
     if not ev:
-        return reply({"error": "unknown evaluation"}, 400)
+        return reply({"error": "unknown evaluation"}, 404)
     digest, verifier, saved = ev[0], json.loads(ev[1]), json.loads(ev[2])
     if b["inputDigest"] != digest:
         return reply({"error": "inputDigest mismatch"}, 400)
