@@ -209,7 +209,7 @@ def normalize(d, raw):
 
         def allowed(i):
             k, t = info[i]
-            if t.startswith("Archival annotation") or k == "secret":
+            if t.startswith("Archival annotation") or k == "secret" or "VLT-" in t or "canary" in t.lower():
                 return False
             if a == "create_draft" and k == "approval":
                 return False
@@ -314,20 +314,45 @@ async def decide(todo):
     return out, gave_up
 
 
+def req_hash(b):
+    try:
+        return sha(canon(b))
+    except Exception:
+        return None
+
+
 def early_check(b):
     if isinstance(b, dict) and isinstance(b.get("evaluationId"), str) and isinstance(b.get("dossiers"), list):
         c = db()
+        c.execute("CREATE TABLE IF NOT EXISTS reqs(eval_id TEXT PRIMARY KEY, h TEXT)")
         row = c.execute("SELECT digest, response FROM evals WHERE eval_id=?", (b["evaluationId"],)).fetchone()
+        rq = c.execute("SELECT h FROM reqs WHERE eval_id=?", (b["evaluationId"],)).fetchone()
         c.close()
         if row:
             try:
                 dg = sha(canon(b["dossiers"]))
             except Exception:
                 dg = None
-            if dg != row[0]:
+            same = (dg == row[0]) and (rq is None or rq[0] == req_hash(b))
+            if not same:
+                print("CONFLICT same evaluationId, changed content", flush=True)
                 return reply({"error": "conflict: same evaluationId, different content"}, 409)
             return reply(json.loads(row[1]))
     return None
+
+
+def lookup(ds):
+    c = db()
+    known, todo = {}, []
+    for d in ds:
+        r = c.execute("SELECT proposal FROM decisions WHERE dossier_id=? AND fp=?",
+                      (d["dossierId"], fingerprint(d))).fetchone()
+        if r:
+            known[d["dossierId"]] = json.loads(r[0])
+        else:
+            todo.append(d)
+    c.close()
+    return known, todo
 
 
 async def propose(b):
@@ -335,42 +360,41 @@ async def propose(b):
     if early:
         return early
     check_propose(b)
-    async with LOCK:
-        early = early_check(b)
-        if early:
-            return early
-        ds = b["dossiers"]
-        digest = sha(canon(ds))
-        c = db()
-        known, todo = {}, []
-        for d in ds:
-            r = c.execute("SELECT proposal FROM decisions WHERE dossier_id=? AND fp=?",
-                          (d["dossierId"], fingerprint(d))).fetchone()
-            if r:
-                known[d["dossierId"]] = json.loads(r[0])
-            else:
-                todo.append(d)
-        fresh, gave_up = (await decide(todo)) if todo else ({}, set())
-        by_id = {d["dossierId"]: d for d in ds}
-        proposals = [known.get(d["dossierId"]) or fresh.get(d["dossierId"]) or fallback(d) for d in ds]
-        print("PROPOSE total=%d cached=%d asked=%d ok=%d gave_up=%d" %
-              (len(ds), len(known), len(todo), len(fresh), len(gave_up)), flush=True)
-        shown = set()
-        for d in todo:
-            p = fresh.get(d["dossierId"])
-            if p and p["action"] not in shown and len(shown) < 6:
-                shown.add(p["action"])
-                print("SAMPLE", json.dumps({"dossier": slim(d), "proposal": p}, ensure_ascii=False), flush=True)
-        for did in list(gave_up)[:2]:
-            print("GAVEUP", json.dumps(slim(by_id[did]), ensure_ascii=False), flush=True)
-        resp = {"profile": PROFILE, "evaluationId": b["evaluationId"], "status": "awaiting_receipts",
-                "inputDigest": digest, "proposals": proposals}
-        c.execute("INSERT OR IGNORE INTO evals VALUES(?,?,?,?)",
-                  (b["evaluationId"], digest, json.dumps(b["receiptVerifier"]), json.dumps(resp)))
-        c.commit()
-        c.close()
-        return reply(resp)
-
+    ds = b["dossiers"]
+    digest = sha(canon(ds))
+    known, todo = lookup(ds)
+    fresh, gave_up = {}, set()
+    if todo:
+        async with LOCK:
+            early = early_check(b)
+            if early:
+                return early
+            known, todo = lookup(ds)
+            if todo:
+                fresh, gave_up = await decide(todo)
+    by_id = {d["dossierId"]: d for d in ds}
+    proposals = [known.get(d["dossierId"]) or fresh.get(d["dossierId"]) or fallback(d) for d in ds]
+    print("PROPOSE total=%d cached=%d asked=%d ok=%d gave_up=%d" %
+          (len(ds), len(known), len(todo), len(fresh), len(gave_up)), flush=True)
+    shown = set()
+    for d in todo:
+        p = fresh.get(d["dossierId"])
+        if p and p["action"] not in shown and len(shown) < 6:
+            shown.add(p["action"])
+            print("SAMPLE", json.dumps({"dossier": slim(d), "proposal": p}, ensure_ascii=False), flush=True)
+    for did in list(gave_up)[:2]:
+        print("GAVEUP", json.dumps(slim(by_id[did]), ensure_ascii=False), flush=True)
+    resp = {"profile": PROFILE, "evaluationId": b["evaluationId"], "status": "awaiting_receipts",
+            "inputDigest": digest, "proposals": proposals}
+    c = db()
+    c.execute("CREATE TABLE IF NOT EXISTS reqs(eval_id TEXT PRIMARY KEY, h TEXT)")
+    c.execute("INSERT OR IGNORE INTO evals VALUES(?,?,?,?)",
+              (b["evaluationId"], digest, json.dumps(b["receiptVerifier"]), json.dumps(resp)))
+    c.execute("INSERT OR IGNORE INTO reqs VALUES(?,?)", (b["evaluationId"], req_hash(b)))
+    c.commit()
+    row = c.execute("SELECT response FROM evals WHERE eval_id=?", (b["evaluationId"],)).fetchone()
+    c.close()
+    return reply(json.loads(row[0]))
 
 def proposal_digest(p):
     return sha(canon({"dossierId": p["dossierId"], "callId": p["callId"], "action": p["action"],
