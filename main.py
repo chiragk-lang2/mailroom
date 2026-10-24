@@ -305,6 +305,20 @@ def proposal_digest(p):
                       "evidence": sorted(p["evidence"])}))
 
 
+def strict_sig(s):
+    try:
+        t = s.replace("-", "+").replace("_", "/")
+        t = t + "=" * (-len(t) % 4)
+        raw = base64.b64decode(t, validate=True)
+    except Exception:
+        return None
+    if len(raw) != 64:
+        return None
+    if base64.b64encode(raw).decode().rstrip("=") != t.rstrip("="):
+        return None
+    return raw
+
+
 async def commit(b):
     if not isinstance(b, dict) or b.get("profile") != PROFILE \
        or not isinstance(b.get("evaluationId"), str) \
@@ -318,7 +332,14 @@ async def commit(b):
         return reply({"error": "unknown evaluation"}, 404)
     digest, verifier, saved = ev[0], json.loads(ev[1]), json.loads(ev[2])
     if b["inputDigest"] != digest:
-        return reply({"error": "inputDigest mismatch"}, 409)
+        return reply({"error": "inputDigest mismatch"}, 400)
+    rdigest = sha(canon(b["receipts"]))
+    done = c.execute("SELECT rdigest, response FROM commits WHERE eval_id=?",
+                     (b["evaluationId"],)).fetchone()
+    if done:
+        if done[0] == rdigest:
+            return reply(json.loads(done[1]))
+        return reply({"error": "commit conflict"}, 409)
     props = {p["dossierId"]: p for p in saved["proposals"]}
     if len(b["receipts"]) != len(props):
         raise Bad("receipt count")
@@ -328,31 +349,27 @@ async def commit(b):
         if not isinstance(r, dict):
             raise Bad("receipt shape")
         did = r.get("dossierId")
-        p = props.get(did)
+        p = props.get(did) if isinstance(did, str) else None
         if p is None or did in seen:
             raise Bad("unknown or duplicate receipt")
         seen.add(did)
         if r.get("callId") != p["callId"] or r.get("action") != p["action"] \
            or r.get("proposalDigest") != proposal_digest(p) \
            or not isinstance(r.get("accepted"), bool) \
-           or not isinstance(r.get("receiptId"), str) \
+           or not isinstance(r.get("receiptId"), str) or not r.get("receiptId") \
            or not isinstance(r.get("receiptSignature"), str):
             raise Bad("receipt does not match proposal")
+        sig = strict_sig(r["receiptSignature"])
+        if sig is None:
+            raise Bad("bad signature encoding")
         signed = canon({"profile": PROFILE, "evaluationId": b["evaluationId"],
                         "inputDigest": digest,
                         "receipt": {k: v for k, v in r.items() if k != "receiptSignature"}})
         try:
-            key.verify(base64.b64decode(r["receiptSignature"]), signed.encode("utf-8"))
+            key.verify(sig, signed.encode("utf-8"))
         except Exception:
             raise Bad("bad signature")
         accepted[did] = r
-    rdigest = sha(canon(b["receipts"]))
-    done = c.execute("SELECT rdigest, response FROM commits WHERE eval_id=?",
-                     (b["evaluationId"],)).fetchone()
-    if done:
-        if done[0] == rdigest:
-            return reply(json.loads(done[1]))
-        return reply({"error": "commit conflict"}, 409)
     outcomes = []
     for p in saved["proposals"]:
         r = accepted[p["dossierId"]]
